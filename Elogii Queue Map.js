@@ -2,8 +2,8 @@
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
  */
-define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
-    function (record, search, runtime, log, format, task) {
+define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/query'],
+    function (record, search, runtime, log, format, task, query) {
 
         const STATUS = {
             PENDING: 1,
@@ -15,10 +15,8 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
         };
 
         function getInputData() {
-
             log.debug('getInputData', 'Searching for PENDING queue records');
-
-            const queueSearch = search.create({
+            return search.create({
                 type: 'customrecord_elogii_queue',
                 filters: [
                     ['custrecord_elq_status', 'anyof', STATUS.PENDING]
@@ -27,73 +25,66 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
                     'internalid'
                 ]
             });
-
-            const queueIds = [];
-
-            queueSearch.run().each(result => {
-
-                const qId = result.getValue('internalid');
-
-                // Immediately lock the record (swap PENDING → PROCESSING)
-                record.submitFields({
-                    type: 'customrecord_elogii_queue',
-                    id: qId,
-                    values: {
-                        custrecord_elq_status: STATUS.PROCESSING
-                    }
-                });
-
-                queueIds.push(qId);
-                return true;
-            });
-
-            log.audit('getInputData', `Queued ${queueIds.length} queue jobs for processing.`);
-
-            return queueIds;
         }
 
-        function map(context) {
-            const queueId = context.value;
+        // function map(context) {
+        //     const queueId = context.value;
 
-            log.debug('map', `Processing queue ID ${queueId}`);
+        //     log.debug('map', `Processing queue ID ${queueId}`);
 
-            context.write({
-                key: queueId,
-                value: queueId
-            });
-        }
-
+        //     context.write({
+        //         key: queueId,
+        //         value: queueId
+        //     });
+        // }
 
         function reduce(context) {
             const queueId = parseInt(context.key, 10);
 
             try {
-                // --- Load queue record (defensive) ---
-                let qRec;
+                // --- Lookup queue record fields via N/query (avoids record.load governance) ---
+                let soIdRaw, queueContext, recordType, elogiiId, elogiiInternalId;
                 try {
-                    qRec = record.load({ type: 'customrecord_elogii_queue', id: queueId, isDynamic: false });
+                    const queueResults = query.runSuiteQL({
+                        query: `
+                            SELECT
+                                custrecord_elq_so_id,
+                                custrecord_elq_context,
+                                custrecord_elq_record_type,
+                                custrecord_elq_elogii_id,
+                                custrecord_elq_elogii_internal_id
+                            FROM customrecord_elogii_queue
+                            WHERE id = ?
+                        `,
+                        params: [queueId]
+                    }).asMappedResults();
+
+                    if (!queueResults || queueResults.length === 0) {
+                        log.error('Reduce - Queue Lookup Failed', `Queue ${queueId} not found via SuiteQL`);
+                        return;
+                    }
+
+                    const qRow = queueResults[0];
+                    soIdRaw = qRow.custrecord_elq_so_id;
+                    queueContext = qRow.custrecord_elq_context;     // create / edit / delete / backorder
+                    recordType = qRow.custrecord_elq_record_type || record.Type.SALES_ORDER;
+                    elogiiId = qRow.custrecord_elq_elogii_id || null;
+                    elogiiInternalId = qRow.custrecord_elq_elogii_internal_id || null;
                 } catch (e) {
-                    log.error('Reduce - Load Queue Failed', `Queue ${queueId} load error: ${e.message}`);
+                    log.error('Reduce - Queue Lookup Failed', `Queue ${queueId} SuiteQL error: ${e.message}`);
                     return;
                 }
 
-                // Mark PROCESSING early so other MR runs / SS know it's being handled
-                try {
-                    record.submitFields({
-                        type: 'customrecord_elogii_queue',
-                        id: queueId,
-                        values: { custrecord_elq_status: STATUS.PROCESSING }
-                    });
-                } catch (e) {
-                    log.error('Reduce - Mark Processing Failed', `Queue ${queueId} cannot be set to PROCESSING: ${e.message}`);
-                    // continue — we still attempt to process
-                }
-
-                // Read key fields from queue
-                const soIdRaw = qRec.getValue('custrecord_elq_so_id');
-                let queueContext = qRec.getValue('custrecord_elq_context'); // create / edit / delete / backorder
-                const recordType = qRec.getValue('custrecord_elq_record_type') || record.Type.SALES_ORDER;
-                let elogiiId = qRec.getValue('custrecord_elq_elogii_id') || null;
+                // // Mark PROCESSING early so other MR runs / SS know it's being handled
+                // try {
+                //     record.submitFields({
+                //         type: 'customrecord_elogii_queue',
+                //         id: queueId,
+                //         values: { custrecord_elq_status: STATUS.PROCESSING }
+                //     });
+                // } catch (e) {
+                //     log.error('Reduce - Mark Processing Failed', `Queue ${queueId} cannot be set to PROCESSING: ${e.message}`);
+                // }
 
                 // ensure soId is integer string (clean any accidental decimals)
                 const soId = parseInt(String(soIdRaw).replace(/\D/g, ''), 10);
@@ -106,7 +97,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
                         filters: [
                             ['custrecord_elq_so_id', 'is', soId],
                             'AND',
-                            ['custrecord_elq_status', 'anyof', [STATUS.PENDING, STATUS.PROCESSING, STATUS.PROCESSED]]
+                            ['custrecord_elq_status', 'anyof', [STATUS.PENDING, STATUS.PROCESSING, STATUS.PROCESSED, STATUS.RETRY]]
                         ],
                         columns: [
                             search.createColumn({ name: 'internalid', sort: search.Sort.DESC }),
@@ -135,82 +126,129 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
                     }
                 } catch (e) {
                     log.error('Consolidation Search Error', e);
-                    // proceed — not fatal
                 }
 
-                // --- Load the underlying transaction unless it's a delete request ---
-                let soRec = null;
+                // --- Lookup all required transaction body fields via N/query ---
+                let txnData = null;
+                let soStatus = null;
+
                 if (queueContext !== 'delete') {
                     try {
-                        soRec = record.load({ type: recordType, id: soId, isDynamic: false });
-                        log.debug('Reduce - Loaded Record', `${recordType} ${soId} loaded`);
-                        // --- SAFETY CHECK: SO now has an eLogii ID but queue record does not ---
-                        const currentElogiiId = soRec.getValue({ fieldId: 'custbody_lap_elogii_id' }) || null;
+                        const txnResults = query.runSuiteQL({
+                            query: `
+                                SELECT
+                                    t.status,
+                                    t.custbody_lap_elogii_id,
+                                    t.custbody_elogii_id_hist,
+                                    t.trandate,
+                                    t.tranid,
+                                    t.custbody_stc_amount_after_discount,
+                                    t.memo,
+                                    t.custbody_daterequired,
+                                    t.entity,
+                                    CASE
+                                        WHEN c.isperson = 'T' THEN c.firstname || ' ' || c.lastname
+                                        ELSE c.companyname
+                                    END AS entityname,
+                                    t.custbody_fulfillment_email,
+                                    t.custbody_customer_band,
+                                    BUILTIN.DF(t.custbody_customer_band) AS customerbandname,
+                                    t.custbody_lpl_sitecontact,
+                                    t.custbody_lpl_sitecontactphone,
+                                    t.custbody_alf_subsidiary_name AS subsidiaryname,
+                                    t.shipmethod,
+                                    sm.itemid AS shipmethodname,
+                                    t.custbody_lap_cust_pickup,
+                                    t.custbody_lap_deliv_by_time,
+                                    t.custbody_raisedby,
+                                    e.firstname || ' ' || e.lastname AS raisedbyname,
+                                    sa.addr1     AS shipaddr1,
+                                    sa.addr2     AS shipaddr2,
+                                    sa.city      AS shipcity,
+                                    sa.zip       AS shipzip,
+                                    sa.country   AS shipcountry
+                                FROM transaction t
+                                LEFT JOIN customer c ON c.id = t.entity
+                                LEFT JOIN employee e ON e.id = t.custbody_raisedby
+                                LEFT JOIN shipItem sm ON sm.id = t.shipmethod
+                                LEFT JOIN transactionShippingAddress sa
+                                    ON sa.nkey = t.shippingaddress
+                                    WHERE t.id = ?
+                            `,
+                            params: [soId]
+                        }).asMappedResults();
 
+                        if (!txnResults || txnResults.length === 0) {
+                            throw new Error(`Transaction ${soId} not found via SuiteQL`);
+                        }
+
+                        txnData = txnResults[0];
+                        soStatus = txnData.status || null;
+
+                        log.debug('Reduce - Transaction Lookup', `${recordType} ${soId} queried; status=${soStatus}`);
+
+                        // --- SAFETY CHECK: SO now has an eLogii ID but queue record does not ---
+                        const currentElogiiId = txnData.custbody_lap_elogii_id || null;
                         if (currentElogiiId && !elogiiId) {
                             log.audit('Elogii ID Sync',
                                 `Queue ${queueId} missing eLogii ID. SO ${soId} has ID ${currentElogiiId}. Updating queue.`);
 
-                            // Update queue record so it reflects the real state
                             record.submitFields({
                                 type: 'customrecord_elogii_queue',
                                 id: queueId,
                                 values: {
                                     custrecord_elq_elogii_id: currentElogiiId,
-                                    custrecord_elq_context: 'edit' // prevent accidental "create"
+                                    custrecord_elq_context: 'edit'
                                 }
                             });
 
-                            // Overwrite local variable so the rest of reduce() uses the correct ID/context
                             elogiiId = currentElogiiId;
                             queueContext = 'edit';
                         }
 
                     } catch (e) {
-                        log.error('Record Load Error', `Cannot load ${recordType} ${soId}: ${e.message}`);
-                        // mark queue PROCESSED with note so SS can decide; don't set ERROR here
+                        log.error('Transaction Lookup Error', `Cannot query ${recordType} ${soId}: ${e.message}`);
                         try {
                             record.submitFields({
                                 type: 'customrecord_elogii_queue',
                                 id: queueId,
                                 values: {
                                     custrecord_elq_status: STATUS.PROCESSED,
-                                    custrecord_elq_last_error: `Load failed: ${e.message}`
+                                    custrecord_elq_last_error: `Transaction lookup failed: ${e.message}`
                                 }
                             });
                         } catch (sfe) {
-                            log.error('Queue Update Error', `Failed to mark queue ${queueId} PROCESSED after load failure: ${sfe.message}`);
+                            log.error('Queue Update Error', `Failed to mark queue ${queueId} PROCESSED after lookup failure: ${sfe.message}`);
                         }
                         return;
                     }
                 }
 
-                // --- Special handling for backorder context: reset fields on the transaction then force create context ---
-                if (queueContext === 'backorder' && soRec) {
+                // --- Special handling for backorder context: reset fields on the transaction ---
+                // Uses submitFields — no record.load required; history computed from queried fields above.
+                if (queueContext === 'backorder' && txnData) {
                     try {
-                        const thisElogiiId = soRec.getValue({ fieldId: 'custbody_lap_elogii_id' }) || '';
-                        const histElogiiId = soRec.getValue({ fieldId: 'custbody_elogii_id_hist' }) || '';
-                        const concatElogiiId = (thisElogiiId ? thisElogiiId : '') + (histElogiiId ? (histElogiiId ? ', ' + histElogiiId : '') : '');
-                        // Preserve history, clear current eLogii fields and routing details
-                        soRec.setValue({ fieldId: 'custbody_elogii_id_hist', value: concatElogiiId || histElogiiId });
-                        soRec.setValue({ fieldId: 'custbody_lap_elogii_id', value: null });
-                        soRec.setValue({ fieldId: 'custbody_lap_elogii_task_status', value: null });
-                        soRec.setValue({ fieldId: 'custbody_lap_elogii_trck_link', value: null });
-                        soRec.setValue({ fieldId: 'custbody_driver', value: null });
-                        soRec.setValue({ fieldId: 'custbody_route_stop_num', value: null });
-                        // note: use the real field id for "released" in your account; you used custbody_released earlier
-                        soRec.setValue({ fieldId: 'custbody_released', value: false });
+                        const thisElogiiId = txnData.custbody_lap_elogii_id || '';
+                        const histElogiiId = txnData.custbody_elogii_id_hist || '';
+                        const concatElogiiId = (thisElogiiId ? thisElogiiId : '') + (histElogiiId ? ', ' + histElogiiId : '');
 
-                        // save transaction changes
-                        const updatedId = soRec.save();
-                        log.audit('Backorder Reset', `SO ${soId} fields reset for backorder, saved as ${updatedId}`);
+                        record.submitFields({
+                            type: recordType,
+                            id: soId,
+                            values: {
+                                custbody_elogii_id_hist: concatElogiiId || histElogiiId,
+                                custbody_lap_elogii_id: '',
+                                custbody_lap_elogii_task_status: '',
+                                custbody_lap_elogii_trck_link: '',
+                                custbody_driver: '',
+                                custbody_route_stop_num: '',
+                                custbody_released: false
+                            }
+                        });
+                        log.audit('Backorder Reset', `SO ${soId} fields reset for backorder via submitFields`);
 
-                        // ensure the queueContext is treated as create by SS — keep that intent in the queue record context field
-                        // we will not change queueContext local var here; we'll update the queue record context below if needed
-                        // but set local variable so payload builder treats it as create if it relies on queueContext
                     } catch (e) {
                         log.error('Backorder Reset Error', e);
-                        // continue — we will still attempt to build payload
                     }
                 }
 
@@ -223,7 +261,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
                     if (queueContext === 'delete') {
 
                         if (!elogiiId) {
-                            // No eLogii ID → nothing to delete on eLogii, mark success & exit
+                            // No eLogii ID = nothing to delete on eLogii, mark success & exit
                             record.submitFields({
                                 type: 'customrecord_elogii_queue',
                                 id: queueId,
@@ -236,14 +274,12 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
                             return;
                         }
 
-                        // Has eLogii ID → send delete request
-                        payloadObj = { action: 'delete', elogiiId };
-
+                        // Has eLogii ID = send delete request
                         record.submitFields({
                             type: 'customrecord_elogii_queue',
                             id: queueId,
                             values: {
-                                custrecord_elq_payload: JSON.stringify({ payload: payloadObj, elogiiId }),
+                                custrecord_elq_payload: elogiiInternalId,
                                 custrecord_elq_context: 'delete',
                                 custrecord_elq_status: STATUS.PROCESSED,
                                 custrecord_elq_last_error: ''
@@ -253,17 +289,15 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
                         return;
                     }
 
-
                     // --------------------------------------------------
                     // CASE 2: CLOSED (record exists)
                     // --------------------------------------------------
 
-                    const soStatus = soRec.getValue({ fieldId: 'status' });
-
                     if (soStatus === 'Closed') {
 
                         // Only treat as delete if ALL lines are closed
-                        const isFullyClosed = allLinesClosed(soRec);
+                        const isFullyClosed = allLinesClosed(soId);
+                        log.debug('Closed Status Check', `SO ${soId} closed status; fully closed = ${isFullyClosed}`);
 
                         if (!isFullyClosed) {
                             log.audit('Closed but Not Fully Closed',
@@ -271,9 +305,10 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
                             return;
                         }
 
-                        // Fully closed — now handle eLogii delete flow
+                        // Fully closed - now handle eLogii delete flow
                         if (!elogiiId) {
-                            // No eLogii ID → nothing to delete, mark queue as success
+                            // No eLogii ID = nothing to delete, mark queue as success
+                            log.debug('Closed without Elogii ID', `SO ${soId} closed but has no eLogii ID; marking queue ${queueId} as SUCCESS.`);
                             record.submitFields({
                                 type: 'customrecord_elogii_queue',
                                 id: queueId,
@@ -284,23 +319,22 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
                                 }
                             });
                             return;
+                        } else {
+                            log.debug('Closed with Elogii ID', `SO ${soId} is fully closed and has eLogii ID ${elogiiId}; enqueuing delete for internal id ${elogiiInternalId}.`);
+                            // Record fully closed and has an eLogii ID = enqueue delete
+                            record.submitFields({
+                                type: 'customrecord_elogii_queue',
+                                id: queueId,
+                                values: {
+                                    custrecord_elq_payload: elogiiInternalId,
+                                    custrecord_elq_context: 'delete',
+                                    custrecord_elq_status: STATUS.PROCESSED,
+                                    custrecord_elq_last_error: ''
+                                }
+                            });
+
+                            return;
                         }
-
-                        // Record fully closed and has an eLogii ID → enqueue delete
-                        payloadObj = { action: 'delete', elogiiId };
-
-                        record.submitFields({
-                            type: 'customrecord_elogii_queue',
-                            id: queueId,
-                            values: {
-                                custrecord_elq_payload: JSON.stringify({ payload: payloadObj, elogiiId }),
-                                custrecord_elq_context: 'delete',
-                                custrecord_elq_status: STATUS.PROCESSED,
-                                custrecord_elq_last_error: ''
-                            }
-                        });
-
-                        return;
                     }
                 }
                 catch (e) {
@@ -309,8 +343,8 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
                 }
 
                 try {
-                    const buildResult = buildPayloadFromSalesOrder(soRec, recordType);
-                    // buildResult must return { payload, elogiiId } as in your MR helper
+                    const buildResult = buildPayloadFromSalesOrder(txnData, soId);
+                    // buildResult must return { payload, elogiiId }
                     payloadObj = buildResult && buildResult.payload ? buildResult.payload : null;
                 } catch (e) {
                     log.error('Payload Build Error', `Failed to build payload for ${recordType} ${soId}: ${e.message}`);
@@ -407,80 +441,92 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
             summary.reduceSummary.errors.iterator().each((key, err) => { log.error('Reduce error ' + key, err); return true; });
         }
 
+        // ---------------- Helpers ----------------
+
         // ---------- helper to build payload ----------
-        function buildPayloadFromSalesOrder(salesOrder, recordType) {
-            const soId = salesOrder.id;
-            const tranDate = salesOrder.getValue({ fieldId: 'trandate' });
-            const reqDate = salesOrder.getValue({ fieldId: 'custbody_daterequired' });
-            let futureOrder
-            if (reqDate > new Date()) {
-                futureOrder = 'Future Order'
+        /**
+         * Builds the eLogii payload from a plain txnData object returned by N/query.
+         * @param {Object} txnData  - Mapped SuiteQL result row for the transaction.
+         * @param {number} soId     - Internal ID of the transaction.
+         */
+        function buildPayloadFromSalesOrder(txnData, soId) {
+            // SuiteQL returns dates as DD/MM/YYYY — parse manually
+            const parseNSDate = (dateStr) => {
+                if (!dateStr) return null;
+                const parts = String(dateStr).split('/');
+                if (parts.length === 3) {
+                    // DD/MM/YYYY
+                    return new Date(parts[2], parts[1] - 1, parts[0]);
+                }
+                return new Date(dateStr); // fallback for ISO format
+            };
+
+            const tranDate = parseNSDate(txnData.trandate);
+            const reqDate = parseNSDate(txnData.custbody_daterequired);
+
+            let futureOrder;
+            if (reqDate && new Date(reqDate) > new Date()) {
+                futureOrder = 'Future Order';
             }
+
             let formattedTranDate = null;
             if (tranDate) {
-                // format to YYYYMMDD
-                const d = new Date(tranDate);
-                const yyyy = d.getFullYear();
-                const mm = String(d.getMonth() + 1).padStart(2, '0');
-                const dd = String(d.getDate()).padStart(2, '0');
-                formattedTranDate = `${yyyy}${mm}${dd}`;
+                const yyyy = tranDate.getFullYear();
+                const mm = String(tranDate.getMonth() + 1).padStart(2, '0');
+                const dd = String(tranDate.getDate()).padStart(2, '0');
+                formattedTranDate = parseInt(`${yyyy}${mm}${dd}`, 10);
             }
 
-            const tranDocNumber = salesOrder.getText({ fieldId: 'tranid' });
-            const subTotal = salesOrder.getValue({ fieldId: 'subtotal' });
-            const memo = salesOrder.getValue({ fieldId: 'memo' });
-            const elogiiId = salesOrder.getValue({ fieldId: 'custbody_lap_elogii_id' }) || null;
+            const tranDocNumber = txnData.tranid;
+            const subTotal = txnData.custbody_stc_amount_after_discount;
+            const memo = txnData.memo;
+            const elogiiId = txnData.custbody_lap_elogii_id || null;
 
             // Customer + contact
-            let customerId = salesOrder.getValue({ fieldId: "entity" });
-            let customerText = salesOrder.getText({ fieldId: "entity" });
-            let custFieldLookUp = search.lookupFields({
-                type: search.Type.CUSTOMER,
-                id: customerId,
-                columns: ["custentity_email_itemfulfillment"]
-            });
-            let customerItemFulfilEmail = custFieldLookUp?.custentity_email_itemfulfillment;
+            const customerText = txnData.entityname || '';  // resolved display name from customer join
+            const customerItemFulfilEmail = txnData.custbody_fulfillment_email || null;
+            const spendBand = txnData.custbody_customer_band;
+            const siteContactName = txnData.custbody_lpl_sitecontact;
+            const siteContactPhoneNum = txnData.custbody_lpl_sitecontactphone;
 
-            let siteContactName = salesOrder.getValue({ fieldId: "custbody_lpl_sitecontact" });
-            let siteContactPhoneNum = salesOrder.getValue({ fieldId: "custbody_lpl_sitecontactphone" });
+            // Subsidiary details (cached after first lookup)
+            const subsName = txnData.subsidiaryname;
+            const subsObj = getSubsidiary(subsName);
 
-            // Subsidiary details
-            let subsId = salesOrder.getValue("subsidiary");
-            let subsObj = getSubsidiary(subsId);
+            // Shipping address — available directly on the transaction table
+            const shipaddr1 = txnData.shipaddr1 || '';
+            const shipaddr2 = txnData.shipaddr2 || '';
+            const shipcity = txnData.shipcity || '';
+            const shipzip = txnData.shipzip || '';
+            const shipcountry = txnData.shipcountry || '';
 
-            // Shipping address
-            let shippingAddressSubrecord = salesOrder.getSubrecord({ fieldId: 'shippingaddress' });
-            let shipaddr1 = shippingAddressSubrecord.getText({ fieldId: 'addr1' });
-            let shipaddr2 = shippingAddressSubrecord.getText({ fieldId: 'addr2' });
-            let shipcity = salesOrder.getText({ fieldId: 'shipcity' });
-            let shipzip = salesOrder.getText({ fieldId: 'shipzip' });
-            let shipcountry = shippingAddressSubrecord.getValue({ fieldId: 'country' });
-            let shipMethod = salesOrder.getText({ fieldId: 'shipmethod' });
-            if (shipMethod !== 'Lapwing Van') {
-                shipMethod = 'Courier';
+            const shipMethod = txnData.shipmethodname || '';
+            let collection = txnData.custbody_lap_cust_pickup;
+            collection = (collection === 'T' || collection === true) ? 'Collection' : null;
+
+            let deliveryService = txnData.custbody_lap_deliv_by_time ? String(txnData.custbody_lap_deliv_by_time) : null;
+            if (deliveryService !== '10:30' && deliveryService !== '12:00') {
+                deliveryService = null;
             }
-            let deliveryService = salesOrder.getText({ fieldId: 'custbody_lap_courier' }) || '';
-            if (deliveryService !== 'Pre 12 Delivery' && deliveryService !== 'Pre 10:30 Delivery') {
-                deliveryService = null
-            } else {
-                deliveryService = 'Early Delivery';
-            }
+
+            const spendBandStr = txnData.customerbandname || null;
 
             // Build skills array
-            let skills = [shipMethod, deliveryService, futureOrder].filter(Boolean);
+            const skills = [shipMethod, deliveryService, futureOrder, spendBandStr, collection].filter(Boolean);
 
-            // Items + weight
-            let getSOLinesArrrItemsArr = getSOLinesArr(salesOrder, soId);
+            // Line items via SuiteQL (no record object needed)
+            const lineItems = getSOLinesArr(soId);
+            log.debug('buildPayloadFromSalesOrder - lineItems count', lineItems ? lineItems.length : 'null/undefined');
             // let weightArr = getWeightArray(salesOrder);
 
             // -----------------
-            // Build Elogii payload
+            // Build eLogii payload
             // -----------------
-            let payload = {
+            const payload = {
                 externalId: String(soId),
                 reference: tranDocNumber,
                 type: 1,
-                date: formattedTranDate, // REQUIRED on create
+                date: formattedTranDate,
                 orderValue: subTotal,
                 skills: skills,
                 pickup: {
@@ -492,10 +538,10 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
                         postCode: subsObj.zip,
                         city: subsObj.city,
                         country: subsObj.country,
-                        contactName: salesOrder.getText({ fieldId: "custbody_raisedby" }),
+                        contactName: txnData.raisedbyname || '',
                         contactPhone: subsObj.addrphone
                     },
-                    instructions: salesOrder.getValue({ fieldId: "custbody_drivernotes" })
+                    // instructions: txnData.custbody_drivernotes
                 },
                 location: {
                     type: 2,
@@ -509,25 +555,20 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
                     contactPhone: siteContactPhoneNum,
                     contactEmail: customerItemFulfilEmail
                 },
-                //size: {
-                //    weight: totalWeight(weightArr)
-                //},
-                items: getSOLinesArrrItemsArr,
+                //size: { weight: totalWeight(weightArr) },
+                items: lineItems,
                 internalComment: memo,
                 customData: {
                     RequiredDate: reqDate
                 }
             };
 
-            // // If Return Authorization → swap pickup and dropoff locations
+            // // If Return Authorization = swap pickup and dropoff locations
             // if (recordType === 'returnauthorization' || recordType === record.Type.RETURN_AUTHORIZATION) {
-            //     const originalPickup = payload.pickup.location;
+            //     const originalPickup  = payload.pickup.location;
             //     const originalLocation = payload.location;
-
-            //     // swap
             //     payload.pickup.location = originalLocation;
             //     payload.location = originalPickup;
-
             //     log.debug('RMA Payload Adjustment', 'Swapped pickup and location for return authorization');
             // }
 
@@ -535,42 +576,64 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
         }
 
         /**
-        * Fetches SO record item lines from a given SO record.
-        * @param {Object} loadedSORec - SO record object.
-        * @returns {Array} - An array of objects, each containing various details about a sales order line.
-        */
-        const getSOLinesArr = (loadedSORec, soId) => {
+         * Fetches SO line items via SuiteQL on transactionline
+         * @param {number} soId - Internal ID of the transaction.
+         * @returns {Array} Array of item objects for the eLogii payload.
+         */
+        const getSOLinesArr = (soId) => {
             try {
-                // Initialize empty array to hold sales order items.
+                const lineResults = query.runSuiteQL({
+                    query: `
+                        SELECT
+                            item,
+                            BUILTIN.DF(item)     AS itemname,
+                            quantity,
+                            custcol_quantityremaining,
+                            description,
+                            custcol_alf_item_weight
+                        FROM salesOrderItem
+                        WHERE salesOrder = ?
+                          AND item IS NOT NULL
+                    `,
+                    params: [soId]
+                }).asMappedResults();
+
+                log.debug('getSOLinesArr - raw results', JSON.stringify(lineResults));
+
                 const salesOrderItemsArr = [];
-                // Get the total number of lines in the Sales Order.
-                let lineCount = loadedSORec.getLineCount({ sublistId: 'item' });
-                // Loop through each line to fetch item details.
-                for (let line = 0; line < lineCount; line++) {
-                    const lineKey = loadedSORec.getSublistValue({
-                        sublistId: 'item',
-                        fieldId: 'lineuniquekey',
-                        line
-                    });
-                    // const id = `${soId}_${lineKey}`;
-                    const description = loadedSORec.getSublistValue({ sublistId: 'item', fieldId: 'description', line });
-                    const totalQty = loadedSORec.getSublistValue({ sublistId: 'item', fieldId: 'quantity', line });
-                    const fulQty = loadedSORec.getSublistValue({ sublistId: 'item', fieldId: 'quantityfulfilled', line });
-                    const quantity = parseFloat(totalQty - fulQty);
-                    const qty = quantity; // For customData.);
-                    const itemDisplay = loadedSORec.getSublistValue({ sublistId: 'item', fieldId: 'item_display', line });
-                    let weight = loadedSORec.getSublistValue({ sublistId: 'item', fieldId: 'custcol_ci_itemweight', line });
-                    if (weight == null || weight == "") {
-                        weight = 0;
-                    }
-                    // Create and push item object into the array.
+
+                for (const row of lineResults) {
+                    let description = row.description;
+                    if (!description) description = 'Missing Description';
+
+                    const totalQty = parseFloat(row.quantity) || 0;
+                    const remainingQty = parseFloat(row.custcol_quantityremaining);
+                    // quantityremaining may be null if nothing has been fulfilled yet — fall back to total qty
+                    const quantity = (!isNaN(remainingQty) && remainingQty !== null) ? remainingQty : totalQty;
+
+                    const itemDisplay = row.itemname || String(row.item);
+                    let weight = parseFloat(row.custcol_alf_item_weight);
+                    if (!weight || isNaN(weight)) weight = 0.1;
+
+                    log.debug('getSOLinesArr - row', JSON.stringify({ itemDisplay, quantity, totalQty, remainingQty, weight }));
+
                     if (quantity > 0) {
-                        salesOrderItemsArr.push({description, state: 0, customData: { qty, itemDisplay }, quantity, unitSize: { "Weight kg": weight } });
+                        salesOrderItemsArr.push({
+                            description,
+                            state: 0,
+                            customData: { qty: quantity, itemDisplay },
+                            quantity,
+                            unitSize: { "Weight kg": weight }
+                        });
                     }
                 }
-                // log.debug('getRMALinesArr function: salesOrderItemsArr', salesOrderItemsArr)
+
+                log.debug('getSOLinesArr - final array', JSON.stringify(salesOrderItemsArr));
                 return salesOrderItemsArr;
-            } catch (error) { log.error('Error in getSOLinesArr function', error); }
+            } catch (error) {
+                log.error('Error in getSOLinesArr function', error);
+                return [];
+            }
         };
 
         /**
@@ -578,83 +641,121 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task'],
          * @param {string} subsId - Subsidiary ID.
          * @returns {Object} - An object containing various subsidiary details.
          */
-        let getSubsidiary = (subsId) => {
-            if (!subsId) {
+        const subsidiaryCache = new Map();
+
+        let getSubsidiary = (subsName) => {
+            if (subsidiaryCache.has(subsName)) return subsidiaryCache.get(subsName);
+
+            if (!subsName) {
                 // Handle the error appropriately
-                throw new Error("subsId must be provided");
+                throw new Error("subsName must be provided");
             }
-            let subObj = {}
+
+            let subObj = {};
             try {
-                // Load subsidiary record from SO record
-                let subsidiaryrecord = record.load({ type: record.Type.SUBSIDIARY, id: subsId, });
-                // Get subrecord (address) from the subsidiary record
-                let addressSubrecord = subsidiaryrecord.getSubrecord({ fieldId: "mainaddress" });
-                // Get values from the address subrecord
-                let addr1 = addressSubrecord ? addressSubrecord.getValue({ fieldId: "addr1" }) : "";
-                let addr2 = addressSubrecord ? addressSubrecord.getValue({ fieldId: "addr2" }) : "";
-                let city = addressSubrecord ? addressSubrecord.getValue({ fieldId: "city" }) : "";
-                let country = addressSubrecord ? addressSubrecord.getValue({ fieldId: "country" }) : "";
-                let addrphone = addressSubrecord ? addressSubrecord.getValue({ fieldId: "addrphone" }) : " ";
-                let zip = addressSubrecord ? addressSubrecord.getValue({ fieldId: "zip" }) : "";
-                let addressee = addressSubrecord ? addressSubrecord.getValue({ fieldId: "addressee" }) : "";
+                // Use N/query to fetch subsidiary main address fields directly — avoids record.load governance hit
+                const subsResults = query.runSuiteQL({
+                    query: `
+                        SELECT
+                            s.id,
+                            a.addr1,
+                            a.addr2,
+                            a.city,
+                            a.country,
+                            a.addrphone,
+                            a.zip,
+                            a.addressee
+                        FROM subsidiary s
+                        LEFT JOIN SubsidiaryMainAddress a ON a.nkey = s.mainAddress
+                        WHERE s.name = ?
+                    `,
+                    params: [subsName]
+                }).asMappedResults();
 
-                subObj = { addressSubrecord, addr1, addr2, city, country, addrphone, zip, addressee }
-
-                return subObj
-
-            } catch (error) { log.error('error in getSubsidiary function', error) }
-        }
-
-        /**
-         * Retrieves the array of weights from the Sales Order record.
-         * @param {Object} salesOrderRec - Sales Order record object.
-         * @returns {Array} Array of weights.
-         */
-        function getWeightArray(salesOrderRec) {
-            let weightArr = [];
-            let linecount = salesOrderRec.getLineCount({ sublistId: "item" });
-            for (let i = 0; i < linecount; i++) {
-                // Get line total weight from custom column field
-                let lineTotalWeight = parseFloat(salesOrderRec.getSublistValue({
-                    sublistId: "item",
-                    fieldId: "custcol_lap_total_weight_on_line_",
-                    line: i
-                }));
-                if (isNaN(lineTotalWeight) || lineTotalWeight === 0) {
-                    lineTotalWeight = 0.1; // Apply the formula: CASE WHEN {custcol_ci_itemweight} IS NULL OR {custcol_ci_itemweight} = 0 THEN 0.1 ELSE {custcol_ci_itemweight} END
+                if (!subsResults || subsResults.length === 0) {
+                    throw new Error(`Subsidiary '${subsName}' not found via SuiteQL`);
                 }
-                weightArr.push(lineTotalWeight);
-            }
-            //log.debug("weightArr: ", typeof weightArr + " " + weightArr);
-            return weightArr;
+
+                const row = subsResults[0];
+                subObj = {
+                    addr1: row.addr1 || '',
+                    addr2: row.addr2 || '',
+                    city: row.city || '',
+                    country: row.country || '',
+                    addrphone: row.addrphone || ' ',
+                    zip: row.zip || '',
+                    addressee: row.addressee || ''
+                };
+
+                subsidiaryCache.set(subsName, subObj);
+                return subObj;
+
+            } catch (error) { log.error('error in getSubsidiary function', error); }
         }
+
+        // /**
+        //  * Retrieves the array of weights from the Sales Order record.
+        //  * @param {Object} salesOrderRec - Sales Order record object.
+        //  * @returns {Array} Array of weights.
+        //  */
+        // function getWeightArray(salesOrderRec) {
+        //     let weightArr = [];
+        //     let linecount = salesOrderRec.getLineCount({ sublistId: "item" });
+        //     for (let i = 0; i < linecount; i++) {
+        //         // Get line total weight from custom column field
+        //         let lineTotalWeight = parseFloat(salesOrderRec.getSublistValue({
+        //             sublistId: "item",
+        //             fieldId: "custcol_lap_total_weight_on_line_",
+        //             line: i
+        //         }));
+        //         if (isNaN(lineTotalWeight) || lineTotalWeight === 0) {
+        //             lineTotalWeight = 0.1; // Apply the formula: CASE WHEN {custcol_ci_itemweight} IS NULL OR {custcol_ci_itemweight} = 0 THEN 0.1 ELSE {custcol_ci_itemweight} END
+        //         }
+        //         weightArr.push(lineTotalWeight);
+        //     }
+        //     //log.debug("weightArr: ", typeof weightArr + " " + weightArr);
+        //     return weightArr;
+        // }
+
+        // /**
+        //  * Calculates the total weight from an array of weights.
+        //  * @param {number[]} weightArr - Array of weights.
+        //  * @returns {number} The total weight.
+        //  */
+        // function totalWeight(weightArr) {
+        //     //log.debug("weightArr values: ", typeof weightArr + ' ' + weightArr);
+        //     // Total Weight
+        //     let totalWeight = weightArr.reduce((a, b) => a + b, 0);
+        //     //log.debug("totalWeight ", typeof totalWeight + " " + totalWeight);
+        //     return Number(totalWeight);
+        // }
 
         /**
-         * Calculates the total weight from an array of weights.
-         * @param {number[]} weightArr - Array of weights.
-         * @returns {number} The total weight.
+         * Returns true only when every line on the transaction has zero remaining quantity.
+         * Uses SuiteQL on transactionline — no record.load required.
+         * @param {number} soId - Internal ID of the transaction.
          */
-        function totalWeight(weightArr) {
-            //log.debug("weightArr values: ", typeof weightArr + ' ' + weightArr);
-            // Total Weight
-            let totalWeight = weightArr.reduce((a, b) => a + b, 0);
-            //log.debug("totalWeight ", typeof totalWeight + " " + totalWeight);
-            return Number(totalWeight);
-        }
+        function allLinesClosed(soId) {
+            try {
+                const result = query.runSuiteQL({
+                    query: `
+                        SELECT COUNT(*) AS openLines
+                        FROM transactionline
+                        WHERE transaction = ?
+                          AND itemtype  != 'Description'
+                          AND item IS NOT NULL
+                          AND (quantity - quantityfulfilled) > 0
+                    `,
+                    params: [soId]
+                }).asMappedResults();
 
-        function allLinesClosed(rec) {
-            const lineCount = rec.getLineCount({ sublistId: 'item' });
-
-            for (let i = 0; i < lineCount; i++) {
-                const total = rec.getSublistValue({ sublistId: 'item', fieldId: 'quantity', line: i });
-                const fulfilled = rec.getSublistValue({ sublistId: 'item', fieldId: 'quantityfulfilled', line: i });
-                const remaining = (total || 0) - (fulfilled || 0);
-
-                // If ANY line still has remaining qty → not closed
-                if (remaining > 0) return false;
+                const openLines = result && result[0] ? parseInt(result[0].openlines, 10) : 0;
+                return openLines === 0;
+            } catch (e) {
+                log.error('allLinesClosed Error', e);
+                return false; // fail safe: don't treat as closed if query fails
             }
-            return true;
         }
 
-        return { getInputData, map, reduce, summarize };
+        return { getInputData, reduce, summarize };
     });
