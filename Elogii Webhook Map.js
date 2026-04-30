@@ -102,7 +102,7 @@ define(['N/record', 'N/search', 'N/log'],
         });
       });
 
-      // 🔥 Single submit per record
+      // Single submit per record
       Object.keys(updates).forEach(recId => {
         safeSubmitFields(
           updates[recId].type,
