@@ -27,29 +27,24 @@ define(['N/record', 'N/runtime', 'N/task', 'N/ui/serverWidget', 'N/url', 'N/sear
 
                     const rec = context.newRecord;
 
-                    // Capture inherited values
                     const inheritedElogiiId = rec.getValue({ fieldId: 'custbody_lap_elogii_id' });
                     const existingHist = rec.getValue({ fieldId: 'custbody_elogii_id_hist' }) || '';
 
                     if (inheritedElogiiId) {
-                        // Move inherited SO eLogii ID into the history field
                         const newHist = existingHist
                             ? `${existingHist}, ${inheritedElogiiId}`
                             : inheritedElogiiId;
 
-                        rec.setValue({
-                            fieldId: 'custbody_elogii_id_hist',
-                            value: newHist
-                        });
+                        rec.setValue({ fieldId: 'custbody_elogii_id_hist', value: newHist });
                     }
 
-                    // ALWAYS reset these fields on fresh RMAs
                     rec.setValue({ fieldId: 'custbody_lap_elogii_id', value: '' });
                     rec.setValue({ fieldId: 'custbody_lap_elogii_trck_link', value: '' });
                     rec.setValue({ fieldId: 'custbody_lap_elogii_task_status', value: '' });
                     rec.setValue({ fieldId: 'custbody_driver', value: '' });
                     rec.setValue({ fieldId: 'custbody_route_stop_num', value: '' });
                     rec.setValue({ fieldId: 'custbody_released', value: false });
+                    rec.setValue({ fieldId: 'custbody_elogii_internal_id', value: '' });
 
                     log.audit('RMA Cleanup (beforeLoad)', `Reset inherited eLogii fields for new RMA ${rec.id}`);
                 }
@@ -68,27 +63,58 @@ define(['N/record', 'N/runtime', 'N/task', 'N/ui/serverWidget', 'N/url', 'N/sear
                 const elogiiId = rec.getValue({ fieldId: 'custbody_lap_elogii_id' });
 
                 if (rec.type !== 'returnauthorization' && ((releaseToElogii === true && elogiiId) || (releaseToElogii === 'T' && elogiiId))) {
-                    const suiteletUrl = url.resolveScript({
-                        scriptId: 'customscript_elogii_backorder_sl',
-                        deploymentId: 'customdeploy_elogii_backorder_sl',
-                        params: { soId }
-                    });
 
-                    form.addButton({
-                        id: 'custpage_elogii_backorder',
-                        label: 'Send Backorder to eLogii',
-                        functionName: `window.open('${suiteletUrl}', '_blank')`
-                    });
+                    // Only show button if today is NOT the created date
+                    const createdDate = rec.getValue({ fieldId: 'trandate' });
+                    const today = new Date();
+                    const created = new Date(createdDate);
+
+                    // Strip time component from both dates for a pure date comparison
+                    today.setHours(0, 0, 0, 0);
+                    created.setHours(0, 0, 0, 0);
+
+                    const isCreatedToday = today.getTime() === created.getTime();
+
+                    if (!isCreatedToday) {
+                        const suiteletUrl = url.resolveScript({
+                            scriptId: 'customscript_elogii_backorder_sl',
+                            deploymentId: 'customdeploy_elogii_backorder_sl',
+                            params: { soId }
+                        });
+
+                        // Wrap the suitelet call in a confirm() popup
+                        const confirmMsg = 'You are about to create a new task in eLogii for the purpose of completing a partially fulfilled or forgotten order. Press OK to continue.';
+
+                        // Inject the named function into the page as inline HTML
+                        const scriptField = form.addField({
+                            id: 'custpage_elogii_backorder_script',
+                            type: serverWidget.FieldType.INLINEHTML,
+                            label: 'Script'
+                        });
+
+                        scriptField.defaultValue = `
+                           <script>
+                            function openElogiiBackorder() {
+                           if (confirm(${JSON.stringify(confirmMsg)})) {
+                            window.open('${suiteletUrl}', '_blank');
+                            }
+                          }
+                          </script>
+                          `;
+
+                        form.addButton({
+                            id: 'custpage_elogii_backorder',
+                            label: 'Send Backorder to eLogii',
+                            functionName: 'openElogiiBackorder()'
+                        });
+                    }
                 }
 
                 if (rec.type === 'returnauthorization') {
-                    const form = context.form;
-
-                    // Remove the "Close" button
                     try { form.removeButton('closeremaining'); } catch (e) { }
-
                     log.debug('RMA UI', 'Close button removed');
-                } else { }
+                }
+
             } catch (e) {
                 log.error('beforeLoad error', e);
             }
@@ -106,32 +132,12 @@ define(['N/record', 'N/runtime', 'N/task', 'N/ui/serverWidget', 'N/url', 'N/sear
                 const newRelease = context.newRecord.getValue({ fieldId: 'custbody_release_to_elogii' });
                 const oldRelease = context.oldRecord ? context.oldRecord.getValue({ fieldId: 'custbody_release_to_elogii' }) : null;
                 const newPickup = context.newRecord.getValue({ fieldId: 'custbody_lap_cust_pickup' });
+                const elogiiInternalId = context.newRecord.getValue({ fieldId: 'custbody_elogii_internal_id' });
 
                 log.debug('afterSubmit Triggered', 'context.type=' + context.type + ', SO/RMA ID=' + salesOrderId);
-                // // --- Ignore Webstore Orders ---
-                // if (context.type === context.UserEventType.WEBSTORE) {
-                //     const rec = context.newRecord;
-
-
-                //     log.audit('UE Skipped: Webstore', `SO/RMA ${rec.id} created from Webstore. Release flag cleared.`);
-
-                //     // Uncheck the Release to eLogii flag
-                //     if (rec.getValue('custbody_release_to_elogii') === true) {
-                //         record.submitFields({
-                //             type: rec.type,
-                //             id: rec.id,
-                //             values: {
-                //                 custbody_release_to_elogii: false
-                //             },
-                //             options: { enableSourcing: false, ignoreMandatoryFields: true }
-                //         });
-                //     }
-
-                //     return;
-                // }
 
                 //----------------------------------------------------------
-                // 1. RELEASE CHECK FIRST → global bypass switch
+                // 1. RELEASE CHECK FIRST -> global bypass switch
                 //----------------------------------------------------------
                 if (newRelease !== true) {
                     log.debug('UE Skipped', `Release to eLogii not enabled for record ${salesOrderId}`);
@@ -139,7 +145,7 @@ define(['N/record', 'N/runtime', 'N/task', 'N/ui/serverWidget', 'N/url', 'N/sear
                 }
 
                 //----------------------------------------------------------
-                // 2. If Release was toggled ON on this edit → treat as CREATE
+                // 2. If Release was toggled ON on this edit -> treat as CREATE
                 //----------------------------------------------------------
                 if (oldRelease !== newRelease) {
                     eventType = 'create';
@@ -161,7 +167,7 @@ define(['N/record', 'N/runtime', 'N/task', 'N/ui/serverWidget', 'N/url', 'N/sear
                         log.audit('Cleanup Triggered', `pickupChangedOn=${pickupChangedOn}`);
 
                         //--------------------------------------------------
-                        // A. If eLogii ID exists → enqueue DELETE
+                        // A. If eLogii ID exists -> enqueue DELETE
                         //--------------------------------------------------
                         if (elogiiId) {
                             const delRec = record.create({
@@ -176,12 +182,13 @@ define(['N/record', 'N/runtime', 'N/task', 'N/ui/serverWidget', 'N/url', 'N/sear
                             }));
                             delRec.setValue('custrecord_elq_status', STATUS.PENDING);
                             delRec.setText('custrecord_elq_context', 'delete');
+                            delRec.setValue('custrecord_elq_elogii_internal_id', elogiiInternalId || '');
 
                             const qId = delRec.save();
                             log.audit('Delete queued', `Queue ID ${qId}`);
                         }
                         //--------------------------------------------------
-                        // B. No eLogii ID → clean existing queue records
+                        // B. No eLogii ID -> clean existing queue records
                         //--------------------------------------------------
                         else {
                             const qSearch = search.create({
@@ -294,7 +301,7 @@ define(['N/record', 'N/runtime', 'N/task', 'N/ui/serverWidget', 'N/url', 'N/sear
                     );
                 }
 
-                const recordType = context.newRecord.type; 
+                const recordType = context.newRecord.type;
                 const cleanId = String(parseInt(salesOrderId, 10));
 
                 const qRec = record.create({
@@ -304,12 +311,12 @@ define(['N/record', 'N/runtime', 'N/task', 'N/ui/serverWidget', 'N/url', 'N/sear
 
                 qRec.setValue({
                     fieldId: 'custrecord_elq_so_id',
-                    value: cleanId  
+                    value: cleanId
                 });
 
                 qRec.setValue({
                     fieldId: 'custrecord_elq_context',
-                    value: eventType 
+                    value: eventType
                 });
 
                 qRec.setValue({
@@ -331,6 +338,12 @@ define(['N/record', 'N/runtime', 'N/task', 'N/ui/serverWidget', 'N/url', 'N/sear
                     fieldId: 'custrecord_elq_next_run',
                     value: new Date()
                 });
+
+                qRec.setValue({
+                    fieldId: 'custrecord_elq_elogii_internal_id',
+                    value: elogiiInternalId || ''
+                });
+
 
                 const qId = qRec.save();
                 log.audit('Queue Created', `Queue ID ${qId} for ${recordType} ${cleanId} (${eventType})`);
