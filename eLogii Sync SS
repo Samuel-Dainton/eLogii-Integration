@@ -1,0 +1,402 @@
+/**
+ * @NApiVersion 2.1
+ * @NScriptType ScheduledScript
+ */
+define(['N/search', 'N/record', 'N/https', 'N/runtime', 'N/log'],
+    (search, record, https, runtime, log) => {
+
+        function execute() {
+            try {
+
+                // --------------------------
+                // 1. GET NETSUITE ORDERS
+                // --------------------------
+                const orders = getRelevantOrders();
+
+                if (!orders.length) {
+                    log.audit('No orders to process');
+                    return;
+                }
+
+                // --------------------------
+                // 2. GET ELOGII DATA
+                // --------------------------
+                const elogiiMap = getElogiiData();
+
+                if (!elogiiMap) {
+                    log.error('Failed to retrieve eLogii data');
+                    return;
+                }
+
+                // --------------------------
+                // 3. COMPARE + UPDATE
+                // --------------------------
+                let updates = 0;
+                let matched = 0;
+                let missing = 0;
+
+                for (const so of orders) {
+
+                    const elogiiId = so.elogiiId;
+                    if (!elogiiId) continue;
+
+                    const elogii = elogiiMap[String(elogiiId)];
+
+                    if (!elogii) {
+                        missing++;
+                        continue;
+                    }
+
+                    matched++;
+
+                    const values = {};
+
+                    // Compare driver
+                    const nsDriver = so.driver || null;
+                    const elogiiDriver = elogii.driver || null;
+                    if (elogiiDriver && elogiiDriver !== nsDriver) {
+                        values.custbody_driver = elogiiDriver;
+                    }
+
+                    // Compare route order
+                    const nsRouteOrder = so.routeOrder || null;
+                    const elogiiRouteOrder = elogii.routeOrder ?? null;
+                    if (elogiiRouteOrder !== null && elogiiRouteOrder !== nsRouteOrder) {
+                        values.custbody_route_stop_num = elogiiRouteOrder;
+                    }
+
+                    // Compare load order
+                    const nsLoadOrder = so.loadOrder || null;
+                    const elogiiLoadOrder = elogii.loadOrder ?? null;
+                    if (elogiiLoadOrder !== null && elogiiLoadOrder !== nsLoadOrder) {
+                        values.custbody_load_order = elogiiLoadOrder;
+                    }
+
+                    // Compare route
+                    const nsRoute = so.route || null;
+                    const elogiiRoute = elogii.route ?? null;
+                    if (elogiiRoute !== null && elogiiRoute !== nsRoute) {
+                        values.custbody_route_uid = elogiiRoute
+                    } 
+
+                    // Check release status based on presence of driver and current NS value
+                    const elogiiHasDriver = !!elogii.driver; // true if firstName exists, false if null
+                    if (elogiiHasDriver && !so.released) {
+                        values.custbody_released = true;
+                    } else if (!elogiiHasDriver && so.released) {
+                        values.custbody_released = false;
+                    }
+
+                    // Compare ship date
+                    const nsDate = so.date
+                        ? formatNsDate(so.date)
+                        : null;
+
+                    const elogiiDate = elogii.date
+                        ? formatDateYYYYMMDD(elogii.date)
+                        : null;
+
+                    if (elogiiDate && elogiiDate !== nsDate) {
+                        log.debug('Date mismatch', {
+                            soId: so.id,
+                            nsDate,
+                            elogiiDate
+                        });
+                        values.shipdate = new Date(elogii.date.getTime()); // force a proper Date object
+                    }
+
+
+                    // If any differences found, update the record
+                    if (Object.keys(values).length) {
+                        // log.debug('Updating record', {
+                        //     id: so.id,
+                        //     values
+                        // });
+                        try {
+                            record.submitFields({
+                                type: so.type,
+                                id: so.id,
+                                values,
+                                options: { enableSourcing: false, ignoreMandatoryFields: true, disableTriggers: true }
+                            });
+
+                            updates++;
+                        } catch (e) {
+                            log.error('Failed to update record', { id: so.id, error: e });
+                        }
+                    }
+
+                    if (matched < 10) {
+                        log.debug('Comparison sample', {
+                            soId: so.id,
+                            elogiiId: so.elogiiId,
+                            ns: {
+                                driver: so.driver,
+                                routeOrder: so.routeOrder,
+                                loadOrder: so.loadOrder,
+                                date: so.date,
+                                released: so.released
+                            },
+                            elogii
+                        });
+                    }
+                }
+
+                log.audit('Match stats', {
+                    checked: orders.length,
+                    matched,
+                    missing
+                });
+
+            } catch (e) {
+                log.error('Script failed', e);
+            }
+        }
+
+        // --------------------------
+        // SEARCH NETSUITE
+        // --------------------------
+        function getRelevantOrders() {
+            const results = [];
+
+            const soSearch = search.create({
+                type: search.Type.TRANSACTION,
+                filters: [
+                    ['mainline', 'is', 'T'],
+                    'AND',
+                    ['type', 'anyof', 'SalesOrd', 'RtnAuth'],
+                    'AND',
+                    ['shipdate', 'onorafter', 'lastyeartodate'],
+                    'AND',
+                    ['status', 'anyof',
+                        'SalesOrd:B', 'SalesOrd:D', 'SalesOrd:E',
+                        'RtnAuth:B', 'RtnAuth:D', 'RtnAuth:E'
+                    ],
+                    'AND',
+                    ['custbody_lap_elogii_id', 'isnotempty', ''],
+                ],
+                columns: [
+                    'internalid',
+                    'shipdate',
+                    'custbody_driver',
+                    'custbody_route_stop_num',
+                    'custbody_load_order',
+                    'custbody_lap_elogii_id',
+                    'custbody_released',
+                    'custbody_route_uid'
+                ]
+            });
+
+            let count = 0;
+            soSearch.run().each(r => {
+                results.push({
+                    id: r.getValue('internalid'),
+                    type: r.recordType, // important for RA vs SO
+                    elogiiId: r.getValue('custbody_lap_elogii_id'),
+                    driver: r.getValue('custbody_driver'),
+                    routeOrder: r.getValue('custbody_route_stop_num') != null
+                        ? Number(r.getValue('custbody_route_stop_num'))
+                        : null,
+                    loadOrder: r.getValue('custbody_load_order') != null
+                        ? Number(r.getValue('custbody_load_order'))
+                        : null,
+                    date: r.getValue('shipdate')
+                        ? r.getValue('shipdate')
+                        : null,
+                    released: r.getValue('custbody_released'),
+                    route: r.getValue('custbody_route_uid')
+                });
+                count++;
+                return true;
+                // return count < 200; // limit for testing, remove for production
+            });
+
+            return results;
+        }
+
+        // --------------------------
+        // CALL ELOGII
+        // --------------------------
+
+        /**
+         * Busy-wait sleep for NetSuite (no native sleep available).
+         * @param {number} ms - milliseconds to wait
+         */
+        function sleep(ms) {
+            const start = Date.now();
+            while (Date.now() - start < ms) { /* spin */ }
+        }
+
+        /**
+         * Fetch a URL with automatic retry on HTTP 429 (Too Many Requests).
+         * Waits RETRY_DELAY_MS before each retry, up to MAX_RETRIES attempts.
+         */
+        function fetchWithRetry(url, headers) {
+            const MAX_RETRIES = 5;
+            const RETRY_DELAY_MS = 5000;
+
+            for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                log.debug('Fetching eLogii data', { url, attempt });
+                const response = https.get({ url, headers });
+
+                if (response.code === 429) {
+                    log.audit('eLogii 429 – rate limited, retrying', {
+                        url,
+                        attempt,
+                        retryInMs: RETRY_DELAY_MS
+                    });
+                    if (attempt < MAX_RETRIES) {
+                        sleep(RETRY_DELAY_MS);
+                        continue;
+                    }
+                    // Exhausted all retries
+                    log.error('eLogii 429 – max retries exhausted', { url, attempt });
+                    return response;
+                }
+
+                return response; // success or non-429 error — let the caller handle it
+            }
+        }
+
+        function getElogiiData() {
+
+            const creds = getElogiiApiKeyAndTaskURL();
+            if (!creds.apiKey) return null;
+
+            const today = new Date();
+
+            // Build 62 dates starting from today
+            const dates = Array.from({ length: 62 }, (_, i) => {
+                const date = new Date(today);
+                date.setDate(today.getDate() + i);
+                return formatDateYYYYMMDD(date);
+            });
+
+            const url = `${creds.elogiiURL}?date=${dates.join(',')}`;
+
+            const response = fetchWithRetry(url, {
+                Authorization: `ApiKey ${creds.apiKey}`
+            });
+
+            if (!response || response.code !== 200) {
+                log.error('eLogii error', {
+                    dates,
+                    body: response ? response.body : 'no response'
+                });
+                return {};
+            }
+
+            const body = JSON.parse(response.body);
+            const tasks = Array.isArray(body) ? body : [body];
+
+            const combinedMap = {};
+
+            tasks.forEach(task => {
+
+                const uid = task.uid;
+                if (!uid) return;
+
+                combinedMap[String(uid)] = {
+                    driver: task?.assignment?.assignee?.info?.firstName || null,
+                    routeOrder: task.assignment?.routeOrder,
+                    loadOrder: task.assignment?.loadingOrder,
+                    route: task.assignment?.routeUID,
+                    date: parseDate(task.date),
+                    state: task?.state
+                };
+            });
+
+            return combinedMap;
+        }
+
+        // -------------------------------------------------------------------------
+        // Helpers
+        // -------------------------------------------------------------------------
+
+        function savePayload(date, body) {
+            try {
+                const rec = record.create({
+                    type: 'customrecord_elogii_queue'
+                });
+
+                rec.setValue({
+                    fieldId: 'custrecord_elq_payload',
+                    value: JSON.stringify(body)
+                });
+
+                rec.setValue({
+                    fieldId: 'name',
+                    value: `eLogii ${date}`
+                });
+
+                rec.save();
+            } catch (e) {
+                log.error('Failed to save payload', e);
+            }
+        }
+
+        function formatNsDate(nsDateString) {
+            if (!nsDateString) return null;
+            const parts = String(nsDateString).split('/');
+            if (parts.length === 3) {
+                // NS returns dd/mm/yyyy
+                const [d, m, y] = parts;
+                return `${y}${m.padStart(2, '0')}${d.padStart(2, '0')}`;
+            }
+            // fallback for ISO strings
+            const dt = new Date(nsDateString);
+            if (isNaN(dt.getTime())) return null;
+            return formatDateYYYYMMDD(dt);
+        }
+
+        function formatDateYYYYMMDD(date) {
+            const y = date.getUTCFullYear();
+            const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+            const d = String(date.getUTCDate()).padStart(2, '0');
+            return `${y}${m}${d}`;
+        }
+
+        function parseDate(dateString) {
+            if (!dateString) return null;
+            const ds = String(dateString).trim();
+            if (ds.length < 8) return null;
+            const y = parseInt(ds.slice(0, 4));
+            const m = parseInt(ds.slice(4, 6)) - 1;
+            const d = parseInt(ds.slice(6, 8));
+            const result = new Date(Date.UTC(y, m, d)); // UTC, not local
+            return isNaN(result.getTime()) ? null : result;
+        }
+
+        // reuse your existing helper
+        function getElogiiApiKeyAndTaskURL() {
+            var obj = {};
+            try {
+                const customrecord_deploymentparametersSearchObj = search.create({
+                    type: "customrecord_deploymentparameters",
+                    filters: [["name", "haskeywords", "Elogii"]],
+                    columns: [
+                        search.createColumn({ name: "custrecord_deploymentparametervalue" }),
+                        search.createColumn({ name: "custrecord_deploymentparametervalue2" })
+                    ]
+                });
+
+                customrecord_deploymentparametersSearchObj.run().each(result => {
+                    const v1 = result.getValue({ name: 'custrecord_deploymentparametervalue' });
+                    const v2 = result.getValue({ name: 'custrecord_deploymentparametervalue2' });
+                    if (v1) obj.prodAPIkey = v1;
+                    if (v2) obj.sandboxAPIkey = v2;
+                    return true;
+                });
+
+                const env = runtime.envType;
+                obj.apiKey = env === 'SANDBOX' ? obj.sandboxAPIkey : obj.prodAPIkey;
+                obj.elogiiURL = env === 'SANDBOX' ? 'https://api-sandbox.elogii.com/tasks' : 'https://api-35.elogii.com/tasks';
+                return obj;
+            } catch (err) {
+                log.error('getElogiiApiKeyAndTaskURL error', err);
+                return obj;
+            }
+        }
+
+        return { execute };
+    });
