@@ -141,6 +141,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
                                     t.custbody_lap_elogii_id,
                                     t.custbody_elogii_id_hist,
                                     t.trandate,
+                                    t.shipdate,
                                     t.tranid,
                                     t.custbody_stc_amount_after_discount,
                                     t.memo,
@@ -150,6 +151,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
                                         WHEN c.isperson = 'T' THEN c.firstname || ' ' || c.lastname
                                         ELSE c.companyname
                                     END AS entityname,
+                                    c.entityid AS entityid,
                                     t.custbody_fulfillment_email,
                                     t.custbody_customer_band,
                                     BUILTIN.DF(t.custbody_customer_band) AS customerbandname,
@@ -161,6 +163,8 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
                                     t.custbody_lap_cust_pickup,
                                     t.custbody_lap_deliv_by_time,
                                     t.custbody_raisedby,
+                                    t.custbody_estimatedgrossprofit,
+                                    t.custbody_estimatedgrossprofitpercent,
                                     e.firstname || ' ' || e.lastname AS raisedbyname,
                                     sa.addr1     AS shipaddr1,
                                     sa.addr2     AS shipaddr2,
@@ -173,7 +177,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
                                 LEFT JOIN shipItem sm ON sm.id = t.shipmethod
                                 LEFT JOIN transactionShippingAddress sa
                                     ON sa.nkey = t.shippingaddress
-                                    WHERE t.id = ?
+                                WHERE t.id = ?
                             `,
                             params: [soId]
                         }).asMappedResults();
@@ -343,7 +347,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
                 }
 
                 try {
-                    const buildResult = buildPayloadFromSalesOrder(txnData, soId);
+                    const buildResult = buildPayloadFromSalesOrder(txnData, soId, queueContext);
                     // buildResult must return { payload, elogiiId }
                     payloadObj = buildResult && buildResult.payload ? buildResult.payload : null;
                 } catch (e) {
@@ -449,33 +453,52 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
          * @param {Object} txnData  - Mapped SuiteQL result row for the transaction.
          * @param {number} soId     - Internal ID of the transaction.
          */
-        function buildPayloadFromSalesOrder(txnData, soId) {
-            // SuiteQL returns dates as DD/MM/YYYY — parse manually
-            const parseNSDate = (dateStr) => {
-                if (!dateStr) return null;
-                const parts = String(dateStr).split('/');
-                if (parts.length === 3) {
-                    // DD/MM/YYYY
-                    return new Date(parts[2], parts[1] - 1, parts[0]);
-                }
-                return new Date(dateStr); // fallback for ISO format
+        function buildPayloadFromSalesOrder(txnData, soId, queueContext) {
+
+            const parseNSDate = (value) => {
+                if (!value) return null;
+
+                const parts = String(value).split('/');
+
+                return parts.length === 3
+                    ? new Date(parts[2], parts[1] - 1, parts[0]) // DD/MM/YYYY
+                    : new Date(value);
             };
 
-            const tranDate = parseNSDate(txnData.trandate);
+            const todayNow = new Date();
+
+            const today = new Date(
+                todayNow.getFullYear(),
+                todayNow.getMonth(),
+                todayNow.getDate()
+            );
+
+            let shipDate = parseNSDate(txnData.shipdate)
             const reqDate = parseNSDate(txnData.custbody_daterequired);
 
-            let futureOrder;
-            if (reqDate && new Date(reqDate) > new Date()) {
-                futureOrder = 'Future Order';
+            if (queueContext === 'create') {
+                log.audit("Overwrite Date", shipDate + " with " + today)
+                shipDate = today;
             }
 
-            let formattedTranDate = null;
-            if (tranDate) {
-                const yyyy = tranDate.getFullYear();
-                const mm = String(tranDate.getMonth() + 1).padStart(2, '0');
-                const dd = String(tranDate.getDate()).padStart(2, '0');
-                formattedTranDate = parseInt(`${yyyy}${mm}${dd}`, 10);
+            const futureOrder =
+                reqDate && reqDate > today
+                    ? 'Future Order'
+                    : undefined;
+
+            if (reqDate && (!shipDate || reqDate > shipDate)) {
+                shipDate = reqDate;
             }
+
+            if (!shipDate || shipDate < today) {
+                shipDate = today;
+            }
+
+            const yyyy = shipDate.getFullYear();
+            const mm = String(shipDate.getMonth() + 1).padStart(2, '0');
+            const dd = String(shipDate.getDate()).padStart(2, '0');
+
+            const formattedShipDate = Number(`${yyyy}${mm}${dd}`);
 
             const tranDocNumber = txnData.tranid;
             const subTotal = txnData.custbody_stc_amount_after_discount;
@@ -484,6 +507,8 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
 
             // Customer + contact
             const customerText = txnData.entityname || '';  // resolved display name from customer join
+            const customerId = String(txnData.entityid || '');
+            const customerInternalId = String(txnData.entity);
             const customerItemFulfilEmail = txnData.custbody_fulfillment_email || null;
             const spendBand = txnData.custbody_customer_band;
             const siteContactName = txnData.custbody_lpl_sitecontact;
@@ -517,7 +542,6 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
             // Line items via SuiteQL (no record object needed)
             const lineItems = getSOLinesArr(soId);
             log.debug('buildPayloadFromSalesOrder - lineItems count', lineItems ? lineItems.length : 'null/undefined');
-            // let weightArr = getWeightArray(salesOrder);
 
             // -----------------
             // Build eLogii payload
@@ -526,7 +550,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
                 externalId: String(soId),
                 reference: tranDocNumber,
                 type: 1,
-                date: formattedTranDate,
+                date: formattedShipDate,
                 orderValue: subTotal,
                 skills: skills,
                 pickup: {
@@ -543,9 +567,12 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
                     },
                     // instructions: txnData.custbody_drivernotes
                 },
+                customer: {
+                    externalId: customerInternalId,
+                },
                 location: {
                     type: 2,
-                    name: customerText,
+                    name: customerId + ' ' + customerText,
                     address: `${shipaddr1 || ""} ${shipaddr2 || ""} ${shipcity || ""} ${shipzip || ""} ${shipcountry || ""}`.trim(),
                     addressLine2: shipaddr2,
                     city: shipcity,
@@ -555,11 +582,12 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
                     contactPhone: siteContactPhoneNum,
                     contactEmail: customerItemFulfilEmail
                 },
-                //size: { weight: totalWeight(weightArr) },
                 items: lineItems,
                 internalComment: memo,
                 customData: {
-                    RequiredDate: reqDate
+                    RequiredDate: reqDate,
+                    EstimatedGrossProfit: `£${txnData.custbody_estimatedgrossprofit || 0}`,
+                    EstimatedGrossProfitPercent: `%${txnData.custbody_estimatedgrossprofitpercent || 0}`
                 }
             };
 
@@ -576,7 +604,10 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
         }
 
         /**
-         * Fetches SO line items via SuiteQL on transactionline
+         * Fetches SO line items via SuiteQL.
+         * Joins transaction -> orderLine -> transactionLine -> item.
+         * orderLine is the correct SuiteQL table for SO lines and contains custcol_quantityremaining
+         * via its join to transactionLine.
          * @param {number} soId - Internal ID of the transaction.
          * @returns {Array} Array of item objects for the eLogii payload.
          */
@@ -585,15 +616,23 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
                 const lineResults = query.runSuiteQL({
                     query: `
                         SELECT
-                            item,
-                            BUILTIN.DF(item)     AS itemname,
-                            quantity,
-                            custcol_quantityremaining,
-                            description,
-                            custcol_alf_item_weight
-                        FROM salesOrderItem
-                        WHERE salesOrder = ?
-                          AND item IS NOT NULL
+                            tl.item,
+                            BUILTIN.DF(tl.item)          AS itemname,
+                            ABS(tl.quantity)             AS quantity,
+                            ABS(tl.quantityShipRecv)     AS quantityShipRecv,
+                            tl.memo                      AS description,
+                            tl.custcol_ci_itemweight     AS itemweight,
+                            i.weight                     AS itemweight2 
+                        FROM transaction t
+                        INNER JOIN transactionLine tl
+                            ON tl.transaction = t.id
+                        LEFT JOIN item i
+                            ON i.id = tl.item
+                        WHERE t.id = ?
+                          AND t.type = 'SalesOrd'
+                          AND tl.item IS NOT NULL
+                          AND tl.mainline = 'F'
+                          AND tl.taxline = 'F'
                     `,
                     params: [soId]
                 }).asMappedResults();
@@ -607,12 +646,13 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
                     if (!description) description = 'Missing Description';
 
                     const totalQty = parseFloat(row.quantity) || 0;
-                    const remainingQty = parseFloat(row.custcol_quantityremaining);
-                    // quantityremaining may be null if nothing has been fulfilled yet — fall back to total qty
-                    const quantity = (!isNaN(remainingQty) && remainingQty !== null) ? remainingQty : totalQty;
+                    const quantityshiprecv = parseFloat(row.quantityshiprecv);
+                    // quantityShipRecv may be null before any fulfilment — fall back to total qty
+                    const remainingQty = totalQty - quantityshiprecv;
+                    const quantity = remainingQty > 0 ? remainingQty : 0;
 
                     const itemDisplay = row.itemname || String(row.item);
-                    let weight = parseFloat(row.custcol_alf_item_weight);
+                    let weight = parseFloat(row.itemweight2);
                     if (!weight || isNaN(weight)) weight = 0.1;
 
                     log.debug('getSOLinesArr - row', JSON.stringify({ itemDisplay, quantity, totalQty, remainingQty, weight }));
@@ -692,43 +732,6 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log', 'N/format', 'N/task', 'N/q
 
             } catch (error) { log.error('error in getSubsidiary function', error); }
         }
-
-        // /**
-        //  * Retrieves the array of weights from the Sales Order record.
-        //  * @param {Object} salesOrderRec - Sales Order record object.
-        //  * @returns {Array} Array of weights.
-        //  */
-        // function getWeightArray(salesOrderRec) {
-        //     let weightArr = [];
-        //     let linecount = salesOrderRec.getLineCount({ sublistId: "item" });
-        //     for (let i = 0; i < linecount; i++) {
-        //         // Get line total weight from custom column field
-        //         let lineTotalWeight = parseFloat(salesOrderRec.getSublistValue({
-        //             sublistId: "item",
-        //             fieldId: "custcol_lap_total_weight_on_line_",
-        //             line: i
-        //         }));
-        //         if (isNaN(lineTotalWeight) || lineTotalWeight === 0) {
-        //             lineTotalWeight = 0.1; // Apply the formula: CASE WHEN {custcol_ci_itemweight} IS NULL OR {custcol_ci_itemweight} = 0 THEN 0.1 ELSE {custcol_ci_itemweight} END
-        //         }
-        //         weightArr.push(lineTotalWeight);
-        //     }
-        //     //log.debug("weightArr: ", typeof weightArr + " " + weightArr);
-        //     return weightArr;
-        // }
-
-        // /**
-        //  * Calculates the total weight from an array of weights.
-        //  * @param {number[]} weightArr - Array of weights.
-        //  * @returns {number} The total weight.
-        //  */
-        // function totalWeight(weightArr) {
-        //     //log.debug("weightArr values: ", typeof weightArr + ' ' + weightArr);
-        //     // Total Weight
-        //     let totalWeight = weightArr.reduce((a, b) => a + b, 0);
-        //     //log.debug("totalWeight ", typeof totalWeight + " " + totalWeight);
-        //     return Number(totalWeight);
-        // }
 
         /**
          * Returns true only when every line on the transaction has zero remaining quantity.
